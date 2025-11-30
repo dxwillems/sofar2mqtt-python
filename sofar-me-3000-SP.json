@@ -1,113 +1,81 @@
 {
-	"registers": [
-		{
-			"name": "running_state",
-			"register": "0x200",
-			"function": "mode",
-			"modes": {
-				"0": "Standby",
-				"2": "Charging",
-				"4": "Discharging",
-				"6": "Fault"
-			}
-		},
-		{
-			"name": "grid_voltage",
-			"register": "0x0206",
-			"function": "divide",
-			"factor": 10
-		},
-		{
-			"name": "battery_power",
-			"register": "0x20d",
-			"function": "multiply",
-			"factor": 10
-		},
-		{
-			"name": "grid_freq",
-			"register": "0x20c",
-			"function": "divide",
-			"factor": 100
-		},
-		{
-			"name": "batterySOC",
-			"register": "0x210"
-		},
-		{
-			"name": "battery_voltage",
-			"register": "0x20e",
-			"function": "divide",
-			"factor": 100
-		},
-		{
-			"name": "battery_cycles",
-			"register": "0x22c"
-		},
-		{
-			"name": "battery_temp",
-			"register": "0x211"
-		},
-		{
-			"name": "grid_power",
-			"register": "0x212",
-			"function": "multiply",
-			"factor": 10
-		},
-		{
-			"name": "consumption",
-			"register": "0x213",
-			"function": "multiply",
-			"factor": 10
-		},
-		{
-			"name": "solarPV",
-			"register": "0x215",
-			"function": "multiply",
-			"factor": 10
-		},
-		{
-			"name": "today_generation",
-			"register": "0x218",
-			"function": "divide",
-			"factor": 100
-		},
-		{
-			"name": "today_exported",
-			"register": "0x219",
-			"function": "divide",
-			"factor": 100
-		},
-		{
-			"name": "today_purchase",
-			"register": "0x21a",
-			"function": "divide",
-			"factor": 100
-		},
-		{
-			"name": "today_consumption",
-			"register": "0x21b",
-			"function": "divide",
-			"factor": 100
-		},
-		{
-			"name": "inverter_temp",
-			"register": "0x238"
-		},
-		{
-			"name": "inverterHS_temp",
-			"register": "0x239"
-		},
-		{
-			"name": "solarPVAmps",
-			"register": "0x236",
-			"function": "divide",
-			"factor": 100
-		},
-		{
-			"name": "battery_current",
-			"register": "0x207",
-			"function": "divide",
-			"factor": 100
-		}
-	]
+  "device": "Sofar ME3000SP",
+  "model": "ME3000SP",
+  "modbus_address": 1,
+
+  "registers": [
+    {
+      "name": "running_state",
+      "register": "0x0200",
+      "function": "mode",
+      "modes": {
+        "0": "Standby",
+        "2": "Charging",
+        "4": "Discharging",
+        "6": "Fault"
+      }
+    },
+
+    { "name": "grid_voltage", "register": "0x0206", "function": "divide", "factor": 10 },
+    { "name": "grid_current", "register": "0x0207", "function": "divide", "factor": 100 },
+    { "name": "grid_freq",    "register": "0x020C", "function": "divide", "factor": 100 },
+
+    { "name": "battery_power",    "register": "0x020D", "function": "multiply", "factor": 10 },
+    { "name": "battery_voltage",  "register": "0x020E", "function": "divide", "factor": 100 },
+    { "name": "battery_current",  "register": "0x020F", "function": "divide", "factor": 100 },
+    { "name": "battery_soc",      "register": "0x0210" },
+    { "name": "battery_temp",     "register": "0x0211" },
+
+    { "name": "grid_power",     "register": "0x0212", "function": "multiply", "factor": 10 },
+    { "name": "consumption",    "register": "0x0213", "function": "multiply", "factor": 10 },
+    { "name": "solar_pv_power", "register": "0x0215", "function": "multiply", "factor": 10 },
+
+    { "name": "eps_output_power", "register": "0x0217", "function": "multiply", "factor": 10 },
+
+    { "name": "today_generation",   "register": "0x0218", "function": "divide", "factor": 100 },
+    { "name": "today_exported",     "register": "0x0219", "function": "divide", "factor": 100 },
+    { "name": "today_purchased",    "register": "0x021A", "function": "divide", "factor": 100 },
+    { "name": "today_consumption",  "register": "0x021B", "function": "divide", "factor": 100 },
+
+    { "name": "battery_charge_today",     "register": "0x0224", "function": "multiply", "factor": 10 },
+    { "name": "battery_discharge_today",  "register": "0x0225", "function": "multiply", "factor": 10 },
+
+    { "name": "battery_cycles",     "register": "0x022C" },
+
+    { "name": "inverter_temp",   "register": "0x0238" },
+    { "name": "inverter_hs_temp","register": "0x0239" }
+  ],
+
+  "controls": [
+    {
+      "name": "mode_auto",
+      "type": "raw",
+      "command": "01 42 01 03 00 00",
+      "write": true,
+      "desc": "Set ME3000SP to AUTO mode"
+    },
+    {
+      "name": "mode_wait",
+      "type": "raw",
+      "command": "01 42 01 00 55 55",
+      "write": true,
+      "desc": "Set WAIT mode"
+    },
+    {
+      "name": "force_charge",
+      "type": "raw_template",
+      "command_template": "01 42 01 02 {HH} {LL}",
+      "min": 0,
+      "max": 3000,
+      "desc": "Force battery charge (W)"
+    },
+    {
+      "name": "force_discharge",
+      "type": "raw_template",
+      "command_template": "01 42 01 01 {HH} {LL}",
+      "min": 0,
+      "max": 3000,
+      "desc": "Force discharge (W)"
+    }
+  ]
 }
