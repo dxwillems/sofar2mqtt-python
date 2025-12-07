@@ -26,9 +26,15 @@ def load_config(config_file_path):
 # pylint: disable=too-many-instance-attributes
 class Sofar():
     """ Sofar """
+    MODBUS_FUNCTION_PASSIVE = 0x42
+    SOFAR_FN_STANDBY = 0x0100
+    SOFAR_FN_DISCHARGE = 0x0101
+    SOFAR_FN_CHARGE = 0x0102
+    SOFAR_FN_AUTO = 0x0103
+    SOFAR_PARAM_STANDBY = 0x5555
 
     # pylint: disable=line-too-long,too-many-arguments
-    def __init__(self, config_file_path, daemon, retry, retry_delay, write_retry, write_retry_delay, refresh_interval, broker, port, username, password, topic, write_topic, log_level, device, legacy_publish):
+    def __init__(self, config_file_path, daemon, retry, retry_delay, write_retry, write_retry_delay, refresh_interval, broker, port, username, password, topic, write_topic, log_level, device, legacy_publish, control_topic, max_power):
         self.config = load_config(config_file_path)
         self.write_registers = []
         untested = False
@@ -59,6 +65,9 @@ class Sofar():
         self.legacy_publish = legacy_publish
         self.data = {}
         self.log_level = logging.getLevelName(log_level)
+        self.control_topic = control_topic.rstrip('/') if control_topic else ""
+        self.control_set_topic = f"{self.control_topic}/set" if self.control_topic else ""
+        self.max_power = max_power
         logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.getLevelName(log_level))
         self.mutex = threading.Lock()
         self.client = mqtt.Client(client_id=f"sofar2mqtt-{socket.gethostname()}", userdata=None, protocol=mqtt.MQTTv5, transport="tcp")
@@ -75,6 +84,9 @@ class Sofar():
                 for register in self.write_registers:
                     logging.info(f"Subscribing to {self.write_topic}/{register['name']}")
                     client.subscribe(f"{self.write_topic}/{register['name']}", qos=0, options=None, properties=None)
+                if self.control_topic:
+                    logging.info(f"Subscribing to {self.control_set_topic}/#")
+                    client.subscribe(f"{self.control_set_topic}/#", qos=0, options=None, properties=None)
             except Exception:
                 logging.info(traceback.format_exc())
 
@@ -91,6 +103,9 @@ class Sofar():
             logging.info(f"Received message for {topic}:{payload}")
             if payload == "online":
                 self.publish_mqtt_discovery()
+            return
+        if topic.startswith(f"{self.control_set_topic}/"):
+            self.handle_control_message(topic, payload)
             return
 
         for register in self.write_registers:
@@ -147,7 +162,7 @@ class Sofar():
                                 logging.error(f"No current read value for {register['name']} skipping write operation. Please try again.")
 
         if not found:
-            logging.error(f"Received a request to set an unknown register: {register_name['name']} to {payload}")
+            logging.error(f"Received a request to set an unknown register via topic {topic} payload {payload}")
 
 
     def setup_mqtt(self, logging):
@@ -476,6 +491,89 @@ class Sofar():
                 self.failed.append(registeraddress)
             return value
 
+    def handle_control_message(self, topic, payload):
+        """Process control topics like Sofar2mqtt/set/<command> and send raw modbus commands."""
+        command = topic.split('/')[-1]
+        raw_payload = payload.strip().lower()
+        logging.info(f"Received control request {topic} -> {payload}")
+
+        if command == "standby":
+            if raw_payload != "true":
+                logging.error(f"Standby expects payload 'true', ignoring payload {payload}")
+                self.publish_control_response(command, f"ignored:{payload}")
+                return
+            response_value = self.send_passive_command(self.SOFAR_FN_STANDBY, self.SOFAR_PARAM_STANDBY)
+        elif command == "auto":
+            if raw_payload not in ("true", "battery_save"):
+                logging.error(f"Auto expects 'true' or 'battery_save', ignoring payload {payload}")
+                self.publish_control_response(command, f"ignored:{payload}")
+                return
+            response_value = self.send_passive_command(self.SOFAR_FN_AUTO, 0)
+            if raw_payload == "battery_save":
+                logging.info("battery_save requested; sent AUTO command and flagged battery_save request")
+        elif command in ("charge", "discharge"):
+            try:
+                watts = int(raw_payload)
+            except ValueError:
+                logging.error(f"{command} expects integer payload, ignoring payload {payload}")
+                self.publish_control_response(command, f"ignored:{payload}")
+                return
+            if not 0 <= watts <= self.max_power:
+                logging.error(f"{command} watts value {watts} outside allowed range 0-{self.max_power}")
+                self.publish_control_response(command, f"out_of_range:{watts}")
+                return
+            function_code = self.SOFAR_FN_CHARGE if command == "charge" else self.SOFAR_FN_DISCHARGE
+            response_value = self.send_passive_command(function_code, watts)
+        else:
+            logging.error(f"Unknown control command {command} on topic {topic}")
+            return
+
+        if response_value is None:
+            self.publish_control_response(command, "error")
+        else:
+            self.publish_control_response(command, str(response_value))
+
+    def send_passive_command(self, function_code, parameter):
+        """Send raw modbus passive command (function 0x42) to inverter."""
+        if not self.instrument:
+            logging.error("Instrument not initialised, cannot send control command")
+            return None
+        payload = struct.pack(">HH", function_code, parameter)
+        try:
+            with self.mutex:
+                response = self.instrument._perform_command(  # pylint: disable=protected-access
+                    self.MODBUS_FUNCTION_PASSIVE,
+                    payload,
+                    3
+                )
+        except Exception:
+            logging.error(f"Failed to send passive command {hex(function_code)} param {parameter}")
+            logging.debug(traceback.format_exc())
+            return None
+
+        if response is None or len(response) < 3:
+            logging.error(f"Unexpected passive command response for {hex(function_code)}: {response}")
+            return None
+        byte_count = response[0]
+        if byte_count < 2 or len(response) < byte_count + 1:
+            logging.error(f"Passive command response length mismatch for {hex(function_code)}: {response}")
+            return None
+        status_word = int.from_bytes(response[1:1+byte_count], byteorder="big", signed=False)
+        logging.info(f"Passive command {hex(function_code)} param {parameter} -> {status_word}")
+        return status_word
+
+    def publish_control_response(self, command, payload):
+        """Publish control response to MQTT."""
+        if not self.control_topic:
+            logging.debug("Control topic not configured; skipping control response publish")
+            return
+        topic = f"{self.control_topic}/response/{command}"
+        try:
+            self.client.publish(topic, payload, retain=False)
+        except Exception:
+            logging.info(f"Failed to publish control response for {command}")
+            logging.debug(traceback.format_exc())
+
 @click.command("cli", context_settings={'show_default': True})
 @click.option(
     '--config-file',
@@ -581,10 +679,23 @@ class Sofar():
     default=True,
     help='Publish each register to MQTT individually in addition to state which contains all values',
 )
+@click.option(
+    '--control-topic',
+    envvar='MQTT_CONTROL_TOPIC',
+    default='sofar/control',
+    help='MQTT base topic for control commands',
+)
+@click.option(
+    '--max-power',
+    envvar='MAX_POWER',
+    default=3000,
+    type=int,
+    help='Maximum watts allowed for charge/discharge control commands',
+)
 # pylint: disable=too-many-arguments
-def main(config_file, daemon, retry, retry_delay, write_retry, write_retry_delay, refresh_interval, broker, port, username, password, topic, write_topic, log_level, device, legacy_publish):
+def main(config_file, daemon, retry, retry_delay, write_retry, write_retry_delay, refresh_interval, broker, port, username, password, topic, write_topic, log_level, device, legacy_publish, control_topic, max_power):
     """Main"""
-    sofar = Sofar(config_file, daemon, retry, retry_delay, write_retry, write_retry_delay, refresh_interval, broker, port, username, password, topic, write_topic, log_level, device, legacy_publish)
+    sofar = Sofar(config_file, daemon, retry, retry_delay, write_retry, write_retry_delay, refresh_interval, broker, port, username, password, topic, write_topic, log_level, device, legacy_publish, control_topic, max_power)
     sofar.main()
 
 # pylint: disable=no-value-for-parameter
