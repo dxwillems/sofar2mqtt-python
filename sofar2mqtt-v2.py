@@ -533,84 +533,34 @@ class Sofar():
         else:
             self.publish_control_response(command, str(response_value))
 
-    def modbus_crc16(self, data: bytes) -> int:
-        """Compute Modbus RTU CRC16."""
-        crc = 0xFFFF
-        for b in data:
-            crc ^= b
-            for _ in range(8):
-                if crc & 1:
-                    crc = (crc >> 1) ^ 0xA001
-                else:
-                    crc >>= 1
-        return crc
-
     def send_passive_command(self, function_code, parameter):
-        """
-        Send true Sofar passive-mode command (function 0x42),
-        bypassing minimalmodbus, writing raw Modbus RTU frames directly.
-        """
+        """Send raw modbus passive command (function 0x42) to inverter."""
+        if not self.instrument:
+            logging.error("Instrument not initialised, cannot send control command")
+            return None
+        payload = struct.pack(">HH", function_code, parameter)
         try:
-            ser = self.instrument.serial
-            if not ser.is_open:
-                ser.open()
-        except Exception as e:
-            logging.error(f"Unable to open serial port: {e}")
+            with self.mutex:
+                response = self.instrument._perform_command(  # pylint: disable=protected-access
+                    self.MODBUS_FUNCTION_PASSIVE,
+                    payload,
+                    3
+                )
+        except Exception:
+            logging.error(f"Failed to send passive command {hex(function_code)} param {parameter}")
+            logging.debug(traceback.format_exc())
             return None
 
-        slave_id = self.instrument.address  # normally 1
-
-        # Build passive command frame (no CRC yet)
-        frame = bytearray([
-            slave_id,
-            self.MODBUS_FUNCTION_PASSIVE,
-            (function_code >> 8) & 0xFF,
-            function_code & 0xFF,
-            (parameter >> 8) & 0xFF,
-            parameter & 0xFF
-        ])
-
-        # Append CRC16 (little-endian)
-        crc = self.modbus_crc16(frame)
-        frame.append(crc & 0xFF)         # CRC low byte
-        frame.append((crc >> 8) & 0xFF)  # CRC high byte
-
-        logging.info(f"TX passive frame: {frame.hex()}")
-
-        with self.mutex:
-            try:
-                ser.write(frame)
-                ser.flush()
-
-                # Sofar passive command replies with:
-                # [slave_id][0x42][byte_count][data_hi][data_lo][crc_lo][crc_hi]
-                time.sleep(0.15)
-                response = ser.read(7)
-
-                logging.info(f"RX passive response: {response.hex()}")
-
-                if len(response) < 5:
-                    logging.error(f"Short passive response: {response}")
-                    return None
-
-                if response[1] != self.MODBUS_FUNCTION_PASSIVE:
-                    logging.error("Unexpected function code in response")
-                    return None
-
-                byte_count = response[2]
-                if byte_count != 2:
-                    logging.error(f"Unexpected byte_count={byte_count}")
-                    return None
-
-                status = (response[3] << 8) | response[4]
-                logging.info(f"Passive command {hex(function_code)} param {parameter} -> status={status}")
-
-                return status
-
-            except Exception as e:
-                logging.error(f"Failed passive command {hex(function_code)} param {parameter}: {e}")
-                logging.debug(traceback.format_exc())
-                return None
+        if response is None or len(response) < 3:
+            logging.error(f"Unexpected passive command response for {hex(function_code)}: {response}")
+            return None
+        byte_count = response[0]
+        if byte_count < 2 or len(response) < byte_count + 1:
+            logging.error(f"Passive command response length mismatch for {hex(function_code)}: {response}")
+            return None
+        status_word = int.from_bytes(response[1:1+byte_count], byteorder="big", signed=False)
+        logging.info(f"Passive command {hex(function_code)} param {parameter} -> {status_word}")
+        return status_word
 
     def publish_control_response(self, command, payload):
         """Publish control response to MQTT."""
