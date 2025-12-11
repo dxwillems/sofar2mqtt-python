@@ -491,47 +491,157 @@ class Sofar():
                 self.failed.append(registeraddress)
             return value
 
+    def _modbus_crc(data: bytes) -> bytes:
+        """Calculate Modbus RTU CRC16 (low byte first)."""
+        crc = 0xFFFF
+        for pos in data:
+            crc ^= pos
+            for _ in range(8):
+                if (crc & 0x0001) != 0:
+                    crc >>= 1
+                    crc ^= 0xA001
+                else:
+                    crc >>= 1
+        return bytes([crc & 0xFF, (crc >> 8) & 0xFF])
+
+    def _send_raw_frame(self, payload: list[int]) -> bool:
+        """
+        Send a raw Modbus RTU frame:
+        payload = [addr, function, ...data...]  (without CRC)
+        We append CRC and write directly to the serial port.
+        """
+        if not self.instrument:
+            logging.error("Instrument not initialised, cannot send raw frame")
+            return False
+
+        data = bytes(payload)
+        crc = self._modbus_crc(data)
+        frame = data + crc
+
+        logging.info(f"Sending raw frame: {frame.hex(' ').upper()}")
+
+        try:
+            with self.mutex:
+                if not self.instrument.serial.is_open:
+                    self.instrument.serial.open()
+                self.instrument.serial.write(frame)
+                self.instrument.serial.flush()
+            return True
+        except Exception:
+            logging.error("Failed to send raw frame to inverter")
+            logging.debug(traceback.format_exc())
+            return False
+
+    # ---- Mode helpers (from your ESPHome lambda logic) ----
+
+    def _send_mode_auto(self) -> bool:
+        """
+        Set inverter to AUTO mode.
+        ESPHome equivalent payload: {0x1, 0x42, 0x01, 0x03, 0x00, 0x00}
+        """
+        logging.info("Setting inverter mode: AUTO")
+        payload = [0x01, 0x42, 0x01, 0x03, 0x00, 0x00]
+        return self._send_raw_frame(payload)
+
+    def _send_mode_charge(self, watts: int) -> bool:
+        """
+        Force CHARGE at <watts> W.
+        ESPHome equivalent payload: {0x1, 0x42, 0x01, 0x02, HH, LL}
+        """
+        requested = int(watts)
+        # Clamp to allowed max_power (CLI option, default 3000)
+        rate = max(0, min(self.max_power, requested))
+        logging.info(f"Forcing CHARGE at {rate} W (requested {requested} W)")
+
+        payload = [
+            0x01, 0x42, 0x01, 0x02,
+            (rate >> 8) & 0xFF,
+            rate & 0xFF,
+        ]
+        return self._send_raw_frame(payload)
+
+    def _send_mode_discharge(self, watts: int) -> bool:
+        """
+        Force DISCHARGE at <watts> W.
+        ESPHome equivalent payload: {0x1, 0x42, 0x01, 0x01, HH, LL}
+        """
+        requested = int(watts)
+        rate = max(0, min(self.max_power, requested))
+        logging.info(f"Forcing DISCHARGE at {rate} W (requested {requested} W)")
+
+        payload = [
+            0x01, 0x42, 0x01, 0x01,
+            (rate >> 8) & 0xFF,
+            rate & 0xFF,
+        ]
+        return self._send_raw_frame(payload)
+
     def handle_control_message(self, topic, payload):
-        """Process control topics like Sofar2mqtt/set/<command> and send raw modbus commands."""
+        """
+        Process control topics like:
+          <control_topic>/set/auto
+          <control_topic>/set/charge
+          <control_topic>/set/discharge
+          <control_topic>/set/standby   (currently not implemented with raw 0x42)
+
+        and send raw Modbus 0x42 frames (like the ESPHome lambda).
+        """
         command = topic.split('/')[-1]
         raw_payload = payload.strip().lower()
         logging.info(f"Received control request {topic} -> {payload}")
 
+        success = False
+
         if command == "standby":
-            if raw_payload != "true":
-                logging.error(f"Standby expects payload 'true', ignoring payload {payload}")
-                self.publish_control_response(command, f"ignored:{payload}")
-                return
-            response_value = self.send_passive_command(self.SOFAR_FN_STANDBY, self.SOFAR_PARAM_STANDBY)
+            # You can wire this to some frame if you know it; for now just log.
+            logging.error("Standby command not implemented with new raw 0x42 mode frames")
+            self.publish_control_response(command, "not_implemented")
+            return
+
         elif command == "auto":
-            if raw_payload not in ("true", "battery_save"):
-                logging.error(f"Auto expects 'true' or 'battery_save', ignoring payload {payload}")
+            # Keep compatibility: accept "true", "auto" and "battery_save"
+            if raw_payload not in ("true", "auto", "battery_save"):
+                logging.error(
+                    f"Auto expects payload 'true', 'auto' or 'battery_save', ignoring payload {payload}"
+                )
                 self.publish_control_response(command, f"ignored:{payload}")
                 return
-            response_value = self.send_passive_command(self.SOFAR_FN_AUTO, 0)
+
+            success = self._send_mode_auto()
             if raw_payload == "battery_save":
-                logging.info("battery_save requested; sent AUTO command and flagged battery_save request")
+                # ESPHome had a 'battery_save' branch without a specific frame;
+                # we still send AUTO and leave "save" policy to higher-level logic.
+                logging.info("battery_save requested; inverter set to AUTO mode")
+
         elif command in ("charge", "discharge"):
+            # Expect integer watts
             try:
                 watts = int(raw_payload)
             except ValueError:
                 logging.error(f"{command} expects integer payload, ignoring payload {payload}")
                 self.publish_control_response(command, f"ignored:{payload}")
                 return
+
             if not 0 <= watts <= self.max_power:
                 logging.error(f"{command} watts value {watts} outside allowed range 0-{self.max_power}")
                 self.publish_control_response(command, f"out_of_range:{watts}")
                 return
-            function_code = self.SOFAR_FN_CHARGE if command == "charge" else self.SOFAR_FN_DISCHARGE
-            response_value = self.send_passive_command(function_code, watts)
+
+            if command == "charge":
+                success = self._send_mode_charge(watts)
+            else:
+                success = self._send_mode_discharge(watts)
+
         else:
             logging.error(f"Unknown control command {command} on topic {topic}")
+            self.publish_control_response(command, f"unknown_command:{command}")
             return
 
-        if response_value is None:
+        # Publish response
+        if not success:
             self.publish_control_response(command, "error")
         else:
-            self.publish_control_response(command, str(response_value))
+            self.publish_control_response(command, "ok")
 
     def send_passive_command(self, function_code, parameter):
         """Send raw modbus passive command (function 0x42) to inverter."""
