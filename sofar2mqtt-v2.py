@@ -491,15 +491,14 @@ class Sofar():
                 self.failed.append(registeraddress)
             return value
 
+
     def _modbus_crc(data: bytes) -> bytes:
-        """Calculate Modbus RTU CRC16 (low byte first)."""
         crc = 0xFFFF
         for pos in data:
             crc ^= pos
             for _ in range(8):
-                if (crc & 0x0001) != 0:
-                    crc >>= 1
-                    crc ^= 0xA001
+                if crc & 0x0001:
+                    crc = (crc >> 1) ^ 0xA001
                 else:
                     crc >>= 1
         return bytes([crc & 0xFF, (crc >> 8) & 0xFF])
